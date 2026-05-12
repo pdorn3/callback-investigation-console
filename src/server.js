@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const { Pool } = require('pg');
+const { initDb } = require('./initDb');
 
 const app = express();
 
@@ -42,6 +43,13 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Callback Investigation Console running on port ${PORT}`);
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Callback Investigation Console running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
