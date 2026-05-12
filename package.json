@@ -4,7 +4,7 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
     "create-admin": "node scripts/createAdmin.js"
   },
   "dependencies": {
