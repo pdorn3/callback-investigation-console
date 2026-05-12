@@ -1,10 +1,18 @@
-// src/server.js
 require('dotenv').config();
 
 const express = require('express');
+const { Pool } = require('pg');
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -13,11 +21,25 @@ app.get('/', (req, res) => {
   res.send('Callback Investigation Console is running.');
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'callback-investigation-console'
-  });
+app.get('/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+
+    res.json({
+      ok: true,
+      service: 'callback-investigation-console',
+      db_connected: true,
+      time: result.rows[0].now
+    });
+  } catch (err) {
+    console.error('Health check DB error:', err);
+
+    res.status(500).json({
+      ok: false,
+      db_connected: false,
+      error: err.message
+    });
+  }
 });
 
 app.listen(PORT, () => {
