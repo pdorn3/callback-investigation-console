@@ -1,11 +1,12 @@
+// src/server.js
 require('dotenv').config();
 
+const path = require('path');
 const express = require('express');
 const { Pool } = require('pg');
 const { initDb } = require('./initDb');
 
 const app = express();
-
 const PORT = process.env.PORT || 3000;
 
 const pool = new Pool({
@@ -19,7 +20,11 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.send('Callback Investigation Console is running.');
+  res.redirect('/login');
+});
+
+app.get('/login', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'login.html'));
 });
 
 app.get('/health', async (req, res) => {
