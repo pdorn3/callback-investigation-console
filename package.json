@@ -5,6 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js"
+    "create-admin": "node scripts/createAdmin.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
