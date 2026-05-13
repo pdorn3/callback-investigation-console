@@ -16,7 +16,7 @@ const pool = new Pool({
 });
 
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 app.use(
   session({
@@ -29,6 +29,16 @@ app.use(
 
 function requireAuth(req, res, next) {
   if (!req.session.user) return res.redirect('/login');
+  next();
+}
+
+function requireImportKey(req, res, next) {
+  const providedKey = req.headers['x-import-api-key'];
+
+  if (!process.env.IMPORT_API_KEY || providedKey !== process.env.IMPORT_API_KEY) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
   next();
 }
 
@@ -75,6 +85,101 @@ app.post('/login', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Login error');
+  }
+});
+
+app.post('/api/import-targets', requireImportKey, async (req, res) => {
+  try {
+    const targets = Array.isArray(req.body.targets)
+      ? req.body.targets
+      : [req.body];
+
+    let imported = 0;
+
+    for (const target of targets) {
+      const targetType = target.target_type || 'phone_identity';
+
+      const originatingNumber = target.originating_number || null;
+      const latestCallbackNumber = target.latest_callback_number || null;
+      const allCallbackNumbers = Array.isArray(target.all_callback_numbers)
+        ? target.all_callback_numbers.join(', ')
+        : target.all_callback_numbers || null;
+
+      const recommendedCallNumber =
+        target.recommended_call_number ||
+        latestCallbackNumber ||
+        originatingNumber ||
+        null;
+
+      const targetLabel =
+        target.target_label ||
+        target.company_hint ||
+        target.website_hint ||
+        recommendedCallNumber ||
+        'Investigation target';
+
+      await pool.query(
+        `
+        INSERT INTO investigation_targets (
+          target_type,
+          target_label,
+          originating_number,
+          latest_callback_number,
+          all_callback_numbers,
+          recommended_call_number,
+          website_hint,
+          company_hint,
+          email_hint,
+          address_hint,
+          identity_gap,
+          priority_score,
+          violations_count,
+          affected_users_count,
+          suspected_category,
+          status,
+          first_seen_at,
+          last_seen_at
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'unresolved',$16,$17
+        )
+        ON CONFLICT DO NOTHING
+        `,
+        [
+          targetType,
+          targetLabel,
+          originatingNumber,
+          latestCallbackNumber,
+          allCallbackNumbers,
+          recommendedCallNumber,
+          target.website_hint || null,
+          target.company_hint || null,
+          target.email_hint || null,
+          target.address_hint || null,
+          target.identity_gap || 'Identity incomplete',
+          target.priority_score || 0,
+          target.violations_count || 0,
+          target.affected_users_count || 0,
+          target.suspected_category || null,
+          target.first_seen_at || null,
+          target.last_seen_at || null
+        ]
+      );
+
+      imported += 1;
+    }
+
+    res.json({
+      ok: true,
+      imported
+    });
+  } catch (err) {
+    console.error('Import targets error:', err);
+
+    res.status(500).json({
+      ok: false,
+      error: err.message
+    });
   }
 });
 
