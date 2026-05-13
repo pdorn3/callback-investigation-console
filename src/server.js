@@ -179,10 +179,112 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
 
         <h2>Manual Investigation</h2>
 
-        <p>Call this number manually, then we’ll add result entry next.</p>
+        <form method="POST" action="/investigation/${target.id}/save">
+          <div style="margin-bottom: 12px;">
+            <label>Company Name</label><br>
+            <input type="text" name="company_name" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Website</label><br>
+            <input type="text" name="website" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Email</label><br>
+            <input type="text" name="email" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Agent Name</label><br>
+            <input type="text" name="agent_name" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Service Category</label><br>
+            <input type="text" name="service_category" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Outcome</label><br>
+            <select name="outcome" style="width: 250px; padding: 8px;">
+              <option value="resolved">Resolved</option>
+              <option value="partial">Partial</option>
+              <option value="dead_end">Dead End</option>
+              <option value="ivr_only">IVR Only</option>
+              <option value="hostile">Hostile</option>
+            </select>
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Notes</label><br>
+            <textarea name="notes" rows="6" style="width: 600px; padding: 8px;"></textarea>
+          </div>
+
+          <button type="submit" style="padding: 10px 18px;">
+            Save Investigation Result
+          </button>
+        </form>
       </body>
     </html>
   `);
+});
+
+app.post('/investigation/:id/save', requireAuth, async (req, res) => {
+  try {
+    const {
+      company_name,
+      website,
+      email,
+      agent_name,
+      service_category,
+      outcome,
+      notes
+    } = req.body;
+
+    await pool.query(
+      `
+      INSERT INTO callback_identity_results (
+        callback_target_id,
+        company_name,
+        website,
+        email,
+        agent_name,
+        service_category,
+        outcome,
+        notes,
+        created_by
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `,
+      [
+        req.params.id,
+        company_name,
+        website,
+        email,
+        agent_name,
+        service_category,
+        outcome,
+        notes,
+        req.session.user.id
+      ]
+    );
+
+    await pool.query(
+      `
+      UPDATE callback_targets
+      SET status = 'investigated',
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [req.params.id]
+    );
+
+    res.redirect('/dashboard');
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Failed to save investigation');
+  }
 });
 
 app.get('/logout', (req, res) => {
