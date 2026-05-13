@@ -1,4 +1,3 @@
-// src/server.js
 require('dotenv').config();
 
 const path = require('path');
@@ -45,41 +44,6 @@ app.get('/health', async (req, res) => {
       db_connected: false,
       error: err.message
     });
-  }
-});
-
-app.get('/bootstrap-admin', async (req, res) => {
-  try {
-    const bcrypt = require('bcryptjs');
-
-    const email = 'paul@callback.local';
-    const password = 'ChangeThisPassword123!';
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    await pool.query(
-      `
-      INSERT INTO investigators (
-        email,
-        password_hash,
-        role
-      )
-      VALUES ($1, $2, $3)
-      ON CONFLICT (email)
-      DO NOTHING
-      `,
-      [
-        email,
-        passwordHash,
-        'admin'
-      ]
-    );
-
-    res.send('Admin investigator created.');
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).send(err.message);
   }
 });
 
