@@ -115,6 +115,39 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   `);
 });
 
+app.get('/seed-targets', requireAuth, async (req, res) => {
+  await pool.query(`
+    INSERT INTO callback_targets (
+      callback_number,
+      priority_score,
+      violations_count,
+      affected_users_count,
+      suspected_category,
+      status,
+      first_seen_at,
+      last_seen_at
+    )
+    VALUES
+      ('800-555-0101', 95, 87, 14, 'Medicare', 'unresolved', NOW() - INTERVAL '10 days', NOW()),
+      ('888-555-0102', 82, 64, 9, 'Warranty', 'unresolved', NOW() - INTERVAL '7 days', NOW()),
+      ('877-555-0103', 70, 41, 5, 'Debt Relief', 'unresolved', NOW() - INTERVAL '5 days', NOW())
+    ON CONFLICT (callback_number)
+    DO NOTHING
+  `);
+
+  res.send(`
+    <html>
+      <body style="font-family: Arial; padding: 40px;">
+        <h2>Seed callback targets created.</h2>
+
+        <p>
+          <a href="/dashboard">Back to dashboard</a>
+        </p>
+      </body>
+    </html>
+  `);
+});
+
 app.get('/logout', (req, res) => {
   req.session.destroy(() => {
     res.redirect('/login');
