@@ -32,6 +32,14 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function safe(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 app.get('/', (req, res) => {
   if (!req.session.user) return res.redirect('/login');
   res.redirect('/dashboard');
@@ -72,24 +80,40 @@ app.post('/login', async (req, res) => {
 
 app.get('/dashboard', requireAuth, async (req, res) => {
   const result = await pool.query(`
-    SELECT *
-    FROM callback_targets
-    ORDER BY priority_score DESC, violations_count DESC, last_seen_at DESC NULLS LAST
+    SELECT
+      t.*,
+      r.company_name,
+      r.website,
+      r.service_category AS resolved_service_category,
+      r.outcome AS latest_outcome
+    FROM callback_targets t
+    LEFT JOIN LATERAL (
+      SELECT *
+      FROM callback_identity_results r
+      WHERE r.callback_target_id = t.id
+      ORDER BY r.created_at DESC
+      LIMIT 1
+    ) r ON true
+    ORDER BY t.priority_score DESC, t.violations_count DESC, t.last_seen_at DESC NULLS LAST
   `);
 
-  const rows = result.rows.map((target) => `
-    <tr>
-      <td>${target.priority_score || 0}</td>
-      <td><strong>${target.callback_number}</strong></td>
-      <td>${target.violations_count || 0}</td>
-      <td>${target.affected_users_count || 0}</td>
-      <td>${target.suspected_category || '—'}</td>
-      <td>${target.status}</td>
-      <td>
-        <a href="/investigation/${target.id}">Open</a>
-      </td>
-    </tr>
-  `).join('');
+  const rows = result.rows.map((target) => {
+    const category = target.resolved_service_category || target.suspected_category || '—';
+
+    return `
+      <tr>
+        <td>${target.priority_score || 0}</td>
+        <td><strong>${safe(target.callback_number)}</strong></td>
+        <td>${target.violations_count || 0}</td>
+        <td>${target.affected_users_count || 0}</td>
+        <td>${safe(category)}</td>
+        <td>${safe(target.company_name || '—')}</td>
+        <td>${target.website ? `<a href="${safe(target.website)}" target="_blank">${safe(target.website)}</a>` : '—'}</td>
+        <td>${safe(target.status)}</td>
+        <td><a href="/investigation/${target.id}">Open</a></td>
+      </tr>
+    `;
+  }).join('');
 
   res.send(`
     <html>
@@ -100,7 +124,7 @@ app.get('/dashboard', requireAuth, async (req, res) => {
         <h1>Callback Investigation Console</h1>
 
         <p>
-          Logged in as <strong>${req.session.user.email}</strong>
+          Logged in as <strong>${safe(req.session.user.email)}</strong>
           · <a href="/logout">Logout</a>
         </p>
 
@@ -116,12 +140,14 @@ app.get('/dashboard', requireAuth, async (req, res) => {
               <th>Violations</th>
               <th>Users</th>
               <th>Category</th>
+              <th>Company</th>
+              <th>Website</th>
               <th>Status</th>
               <th>Action</th>
             </tr>
           </thead>
           <tbody>
-            ${rows || '<tr><td colspan="7">No callback targets yet. Click “Seed test targets.”</td></tr>'}
+            ${rows || '<tr><td colspan="9">No callback targets yet. Click “Seed test targets.”</td></tr>'}
           </tbody>
         </table>
       </body>
@@ -153,27 +179,40 @@ app.get('/seed-targets', requireAuth, async (req, res) => {
 });
 
 app.get('/investigation/:id', requireAuth, async (req, res) => {
-  const result = await pool.query(
+  const targetResult = await pool.query(
     `SELECT * FROM callback_targets WHERE id = $1`,
     [req.params.id]
   );
 
-  if (result.rows.length === 0) return res.status(404).send('Target not found');
+  if (targetResult.rows.length === 0) return res.status(404).send('Target not found');
 
-  const target = result.rows[0];
+  const target = targetResult.rows[0];
+
+  const latestResult = await pool.query(
+    `
+    SELECT *
+    FROM callback_identity_results
+    WHERE callback_target_id = $1
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+    [req.params.id]
+  );
+
+  const latest = latestResult.rows[0] || {};
 
   res.send(`
     <html>
       <body style="font-family: Arial; padding: 40px;">
         <p><a href="/dashboard">← Back to dashboard</a></p>
 
-        <h1>${target.callback_number}</h1>
+        <h1>${safe(target.callback_number)}</h1>
 
         <p><strong>Priority:</strong> ${target.priority_score || 0}</p>
         <p><strong>Violations:</strong> ${target.violations_count || 0}</p>
         <p><strong>Affected Users:</strong> ${target.affected_users_count || 0}</p>
-        <p><strong>Category:</strong> ${target.suspected_category || '—'}</p>
-        <p><strong>Status:</strong> ${target.status}</p>
+        <p><strong>Category:</strong> ${safe(latest.service_category || target.suspected_category || '—')}</p>
+        <p><strong>Status:</strong> ${safe(target.status)}</p>
 
         <hr>
 
@@ -182,43 +221,43 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
         <form method="POST" action="/investigation/${target.id}/save">
           <div style="margin-bottom: 12px;">
             <label>Company Name</label><br>
-            <input type="text" name="company_name" style="width: 400px; padding: 8px;" />
+            <input type="text" name="company_name" value="${safe(latest.company_name)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Website</label><br>
-            <input type="text" name="website" style="width: 400px; padding: 8px;" />
+            <input type="text" name="website" value="${safe(latest.website)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Email</label><br>
-            <input type="text" name="email" style="width: 400px; padding: 8px;" />
+            <input type="text" name="email" value="${safe(latest.email)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Agent Name</label><br>
-            <input type="text" name="agent_name" style="width: 400px; padding: 8px;" />
+            <input type="text" name="agent_name" value="${safe(latest.agent_name)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Service Category</label><br>
-            <input type="text" name="service_category" style="width: 400px; padding: 8px;" />
+            <input type="text" name="service_category" value="${safe(latest.service_category || target.suspected_category)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Outcome</label><br>
             <select name="outcome" style="width: 250px; padding: 8px;">
-              <option value="resolved">Resolved</option>
-              <option value="partial">Partial</option>
-              <option value="dead_end">Dead End</option>
-              <option value="ivr_only">IVR Only</option>
-              <option value="hostile">Hostile</option>
+              <option value="resolved" ${latest.outcome === 'resolved' ? 'selected' : ''}>Resolved</option>
+              <option value="partial" ${latest.outcome === 'partial' ? 'selected' : ''}>Partial</option>
+              <option value="dead_end" ${latest.outcome === 'dead_end' ? 'selected' : ''}>Dead End</option>
+              <option value="ivr_only" ${latest.outcome === 'ivr_only' ? 'selected' : ''}>IVR Only</option>
+              <option value="hostile" ${latest.outcome === 'hostile' ? 'selected' : ''}>Hostile</option>
             </select>
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Notes</label><br>
-            <textarea name="notes" rows="6" style="width: 600px; padding: 8px;"></textarea>
+            <textarea name="notes" rows="6" style="width: 600px; padding: 8px;">${safe(latest.notes)}</textarea>
           </div>
 
           <button type="submit" style="padding: 10px 18px;">
@@ -273,11 +312,16 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
     await pool.query(
       `
       UPDATE callback_targets
-      SET status = 'investigated',
+      SET status = $2,
+          suspected_category = COALESCE(NULLIF($3, ''), suspected_category),
           updated_at = NOW()
       WHERE id = $1
       `,
-      [req.params.id]
+      [
+        req.params.id,
+        outcome === 'resolved' || outcome === 'partial' ? 'investigated' : outcome,
+        service_category
+      ]
     );
 
     res.redirect('/dashboard');
