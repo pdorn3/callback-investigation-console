@@ -86,11 +86,11 @@ app.get('/dashboard', requireAuth, async (req, res) => {
       r.website,
       r.service_category AS resolved_service_category,
       r.outcome AS latest_outcome
-    FROM callback_targets t
+    FROM investigation_targets t
     LEFT JOIN LATERAL (
       SELECT *
-      FROM callback_identity_results r
-      WHERE r.callback_target_id = t.id
+      FROM investigation_results r
+      WHERE r.investigation_target_id = t.id
       ORDER BY r.created_at DESC
       LIMIT 1
     ) r ON true
@@ -99,16 +99,25 @@ app.get('/dashboard', requireAuth, async (req, res) => {
 
   const rows = result.rows.map((target) => {
     const category = target.resolved_service_category || target.suspected_category || '—';
+    const displayTarget =
+      target.recommended_call_number ||
+      target.latest_callback_number ||
+      target.originating_number ||
+      target.target_label ||
+      '—';
 
     return `
       <tr>
         <td>${target.priority_score || 0}</td>
-        <td><strong>${safe(target.callback_number)}</strong></td>
+        <td>${safe(target.target_type)}</td>
+        <td><strong>${safe(displayTarget)}</strong></td>
+        <td>${safe(target.originating_number || '—')}</td>
+        <td>${safe(target.latest_callback_number || '—')}</td>
         <td>${target.violations_count || 0}</td>
         <td>${target.affected_users_count || 0}</td>
         <td>${safe(category)}</td>
-        <td>${safe(target.company_name || '—')}</td>
-        <td>${target.website ? `<a href="${safe(target.website)}" target="_blank">${safe(target.website)}</a>` : '—'}</td>
+        <td>${safe(target.company_name || target.company_hint || '—')}</td>
+        <td>${target.website ? `<a href="${safe(target.website)}" target="_blank">${safe(target.website)}</a>` : safe(target.website_hint || '—')}</td>
         <td>${safe(target.status)}</td>
         <td><a href="/investigation/${target.id}">Open</a></td>
       </tr>
@@ -118,10 +127,10 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   res.send(`
     <html>
       <head>
-        <title>Callback Investigation Console</title>
+        <title>Identity Investigation Console</title>
       </head>
       <body style="font-family: Arial; padding: 40px; background: #f9fafb;">
-        <h1>Callback Investigation Console</h1>
+        <h1>Identity Investigation Console</h1>
 
         <p>
           Logged in as <strong>${safe(req.session.user.email)}</strong>
@@ -136,7 +145,10 @@ app.get('/dashboard', requireAuth, async (req, res) => {
           <thead>
             <tr>
               <th>Priority</th>
-              <th>Callback Number</th>
+              <th>Type</th>
+              <th>Recommended Call</th>
+              <th>Originating #</th>
+              <th>Latest Callback #</th>
               <th>Violations</th>
               <th>Users</th>
               <th>Category</th>
@@ -147,7 +159,7 @@ app.get('/dashboard', requireAuth, async (req, res) => {
             </tr>
           </thead>
           <tbody>
-            ${rows || '<tr><td colspan="9">No callback targets yet. Click “Seed test targets.”</td></tr>'}
+            ${rows || '<tr><td colspan="12">No investigation targets yet. Click “Seed test targets.”</td></tr>'}
           </tbody>
         </table>
       </body>
@@ -157,8 +169,16 @@ app.get('/dashboard', requireAuth, async (req, res) => {
 
 app.get('/seed-targets', requireAuth, async (req, res) => {
   await pool.query(`
-    INSERT INTO callback_targets (
-      callback_number,
+    INSERT INTO investigation_targets (
+      target_type,
+      target_label,
+      originating_number,
+      latest_callback_number,
+      all_callback_numbers,
+      recommended_call_number,
+      company_hint,
+      website_hint,
+      identity_gap,
       priority_score,
       violations_count,
       affected_users_count,
@@ -168,11 +188,61 @@ app.get('/seed-targets', requireAuth, async (req, res) => {
       last_seen_at
     )
     VALUES
-      ('800-555-0101', 95, 87, 14, 'Medicare', 'unresolved', NOW() - INTERVAL '10 days', NOW()),
-      ('888-555-0102', 82, 64, 9, 'Warranty', 'unresolved', NOW() - INTERVAL '7 days', NOW()),
-      ('877-555-0103', 70, 41, 5, 'Debt Relief', 'unresolved', NOW() - INTERVAL '5 days', NOW())
-    ON CONFLICT (callback_number)
-    DO NOTHING
+      (
+        'phone_identity',
+        'Originating number with active callback trail',
+        '404-555-1000',
+        '800-555-0101',
+        '877-555-0001, 800-555-0101',
+        '800-555-0101',
+        NULL,
+        NULL,
+        'Need company name and website from callback path',
+        95,
+        87,
+        14,
+        'Medicare',
+        'unresolved',
+        NOW() - INTERVAL '10 days',
+        NOW()
+      ),
+      (
+        'phone_identity',
+        'Originating number; callback appears stale',
+        '404-555-2000',
+        '888-555-0102',
+        '888-555-0102, 888-555-0000',
+        '404-555-2000',
+        NULL,
+        NULL,
+        'Latest callback may be stale; call originating number first',
+        82,
+        64,
+        9,
+        'Warranty',
+        'unresolved',
+        NOW() - INTERVAL '7 days',
+        NOW()
+      ),
+      (
+        'domain_identity',
+        'Domain present but operator unknown',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        'example-loans.com',
+        'Need company/legal identity behind domain',
+        70,
+        41,
+        5,
+        'Loans',
+        'unresolved',
+        NOW() - INTERVAL '5 days',
+        NOW()
+      )
+    ON CONFLICT DO NOTHING
   `);
 
   res.redirect('/dashboard');
@@ -180,7 +250,7 @@ app.get('/seed-targets', requireAuth, async (req, res) => {
 
 app.get('/investigation/:id', requireAuth, async (req, res) => {
   const targetResult = await pool.query(
-    `SELECT * FROM callback_targets WHERE id = $1`,
+    `SELECT * FROM investigation_targets WHERE id = $1`,
     [req.params.id]
   );
 
@@ -191,8 +261,8 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
   const latestResult = await pool.query(
     `
     SELECT *
-    FROM callback_identity_results
-    WHERE callback_target_id = $1
+    FROM investigation_results
+    WHERE investigation_target_id = $1
     ORDER BY created_at DESC
     LIMIT 1
     `,
@@ -201,13 +271,27 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
 
   const latest = latestResult.rows[0] || {};
 
+  const recommendedCall =
+    target.recommended_call_number ||
+    target.latest_callback_number ||
+    target.originating_number ||
+    '—';
+
   res.send(`
     <html>
       <body style="font-family: Arial; padding: 40px;">
         <p><a href="/dashboard">← Back to dashboard</a></p>
 
-        <h1>${safe(target.callback_number)}</h1>
+        <h1>${safe(target.target_label || recommendedCall)}</h1>
 
+        <p><strong>Target Type:</strong> ${safe(target.target_type)}</p>
+        <p><strong>Recommended Call Number:</strong> ${safe(recommendedCall)}</p>
+        <p><strong>Originating Number:</strong> ${safe(target.originating_number || '—')}</p>
+        <p><strong>Latest Callback Number:</strong> ${safe(target.latest_callback_number || '—')}</p>
+        <p><strong>All Callback Numbers:</strong> ${safe(target.all_callback_numbers || '—')}</p>
+        <p><strong>Website Hint:</strong> ${safe(target.website_hint || '—')}</p>
+        <p><strong>Company Hint:</strong> ${safe(target.company_hint || '—')}</p>
+        <p><strong>Identity Gap:</strong> ${safe(target.identity_gap || '—')}</p>
         <p><strong>Priority:</strong> ${target.priority_score || 0}</p>
         <p><strong>Violations:</strong> ${target.violations_count || 0}</p>
         <p><strong>Affected Users:</strong> ${target.affected_users_count || 0}</p>
@@ -221,17 +305,22 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
         <form method="POST" action="/investigation/${target.id}/save">
           <div style="margin-bottom: 12px;">
             <label>Company Name</label><br>
-            <input type="text" name="company_name" value="${safe(latest.company_name)}" style="width: 400px; padding: 8px;" />
+            <input type="text" name="company_name" value="${safe(latest.company_name || target.company_hint)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Website</label><br>
-            <input type="text" name="website" value="${safe(latest.website)}" style="width: 400px; padding: 8px;" />
+            <input type="text" name="website" value="${safe(latest.website || target.website_hint)}" style="width: 400px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
             <label>Email</label><br>
-            <input type="text" name="email" value="${safe(latest.email)}" style="width: 400px; padding: 8px;" />
+            <input type="text" name="email" value="${safe(latest.email || target.email_hint)}" style="width: 400px; padding: 8px;" />
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label>Address</label><br>
+            <input type="text" name="address" value="${safe(latest.address || target.address_hint)}" style="width: 600px; padding: 8px;" />
           </div>
 
           <div style="margin-bottom: 12px;">
@@ -245,6 +334,16 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
           </div>
 
           <div style="margin-bottom: 12px;">
+            <label>Confidence</label><br>
+            <select name="confidence_level" style="width: 250px; padding: 8px;">
+              <option value="">Select</option>
+              <option value="high" ${latest.confidence_level === 'high' ? 'selected' : ''}>High</option>
+              <option value="medium" ${latest.confidence_level === 'medium' ? 'selected' : ''}>Medium</option>
+              <option value="low" ${latest.confidence_level === 'low' ? 'selected' : ''}>Low</option>
+            </select>
+          </div>
+
+          <div style="margin-bottom: 12px;">
             <label>Outcome</label><br>
             <select name="outcome" style="width: 250px; padding: 8px;">
               <option value="resolved" ${latest.outcome === 'resolved' ? 'selected' : ''}>Resolved</option>
@@ -252,6 +351,7 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
               <option value="dead_end" ${latest.outcome === 'dead_end' ? 'selected' : ''}>Dead End</option>
               <option value="ivr_only" ${latest.outcome === 'ivr_only' ? 'selected' : ''}>IVR Only</option>
               <option value="hostile" ${latest.outcome === 'hostile' ? 'selected' : ''}>Hostile</option>
+              <option value="needs_followup" ${latest.outcome === 'needs_followup' ? 'selected' : ''}>Needs Follow-Up</option>
             </select>
           </div>
 
@@ -275,34 +375,40 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
       company_name,
       website,
       email,
+      address,
       agent_name,
       service_category,
+      confidence_level,
       outcome,
       notes
     } = req.body;
 
     await pool.query(
       `
-      INSERT INTO callback_identity_results (
-        callback_target_id,
+      INSERT INTO investigation_results (
+        investigation_target_id,
         company_name,
         website,
         email,
+        address,
         agent_name,
         service_category,
+        confidence_level,
         outcome,
         notes,
         created_by
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       `,
       [
         req.params.id,
         company_name,
         website,
         email,
+        address,
         agent_name,
         service_category,
+        confidence_level,
         outcome,
         notes,
         req.session.user.id
@@ -311,16 +417,24 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
 
     await pool.query(
       `
-      UPDATE callback_targets
+      UPDATE investigation_targets
       SET status = $2,
           suspected_category = COALESCE(NULLIF($3, ''), suspected_category),
+          company_hint = COALESCE(NULLIF($4, ''), company_hint),
+          website_hint = COALESCE(NULLIF($5, ''), website_hint),
+          email_hint = COALESCE(NULLIF($6, ''), email_hint),
+          address_hint = COALESCE(NULLIF($7, ''), address_hint),
           updated_at = NOW()
       WHERE id = $1
       `,
       [
         req.params.id,
         outcome === 'resolved' || outcome === 'partial' ? 'investigated' : outcome,
-        service_category
+        service_category,
+        company_name,
+        website,
+        email,
+        address
       ]
     );
 
@@ -340,7 +454,7 @@ app.get('/health', async (req, res) => {
     const result = await pool.query('SELECT NOW()');
     res.json({
       ok: true,
-      service: 'callback-investigation-console',
+      service: 'identity-investigation-console',
       db_connected: true,
       time: result.rows[0].now
     });
@@ -357,7 +471,7 @@ app.get('/health', async (req, res) => {
 initDb()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Callback Investigation Console running on port ${PORT}`);
+      console.log(`Identity Investigation Console running on port ${PORT}`);
     });
   })
   .catch((err) => {
