@@ -12,9 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: { rejectUnauthorized: false }
 });
 
 app.use(express.urlencoded({ extended: true }));
@@ -25,25 +23,17 @@ app.use(
     secret: process.env.SESSION_SECRET || 'change-this-secret',
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      secure: false
-    }
+    cookie: { secure: false }
   })
 );
 
 function requireAuth(req, res, next) {
-  if (!req.session.user) {
-    return res.redirect('/login');
-  }
-
+  if (!req.session.user) return res.redirect('/login');
   next();
 }
 
 app.get('/', (req, res) => {
-  if (!req.session.user) {
-    return res.redirect('/login');
-  }
-
+  if (!req.session.user) return res.redirect('/login');
   res.redirect('/dashboard');
 });
 
@@ -56,29 +46,16 @@ app.post('/login', async (req, res) => {
     const { email, password } = req.body;
 
     const result = await pool.query(
-      `
-      SELECT *
-      FROM investigators
-      WHERE email = $1
-      LIMIT 1
-      `,
+      `SELECT * FROM investigators WHERE email = $1 LIMIT 1`,
       [email]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(401).send('Invalid credentials');
-    }
+    if (result.rows.length === 0) return res.status(401).send('Invalid credentials');
 
     const user = result.rows[0];
+    const validPassword = await bcrypt.compare(password, user.password_hash);
 
-    const validPassword = await bcrypt.compare(
-      password,
-      user.password_hash
-    );
-
-    if (!validPassword) {
-      return res.status(401).send('Invalid credentials');
-    }
+    if (!validPassword) return res.status(401).send('Invalid credentials');
 
     req.session.user = {
       id: user.id,
@@ -94,22 +71,59 @@ app.post('/login', async (req, res) => {
 });
 
 app.get('/dashboard', requireAuth, async (req, res) => {
+  const result = await pool.query(`
+    SELECT *
+    FROM callback_targets
+    ORDER BY priority_score DESC, violations_count DESC, last_seen_at DESC NULLS LAST
+  `);
+
+  const rows = result.rows.map((target) => `
+    <tr>
+      <td>${target.priority_score || 0}</td>
+      <td><strong>${target.callback_number}</strong></td>
+      <td>${target.violations_count || 0}</td>
+      <td>${target.affected_users_count || 0}</td>
+      <td>${target.suspected_category || '—'}</td>
+      <td>${target.status}</td>
+      <td>
+        <a href="/investigation/${target.id}">Open</a>
+      </td>
+    </tr>
+  `).join('');
+
   res.send(`
     <html>
-      <body style="font-family: Arial; padding: 40px;">
+      <head>
+        <title>Callback Investigation Console</title>
+      </head>
+      <body style="font-family: Arial; padding: 40px; background: #f9fafb;">
         <h1>Callback Investigation Console</h1>
 
         <p>
-          Logged in as:
-          <strong>${req.session.user.email}</strong>
+          Logged in as <strong>${req.session.user.email}</strong>
+          · <a href="/logout">Logout</a>
         </p>
 
         <p>
-          Role:
-          <strong>${req.session.user.role}</strong>
+          <a href="/seed-targets">Seed test targets</a>
         </p>
 
-        <a href="/logout">Logout</a>
+        <table border="1" cellpadding="10" cellspacing="0" style="background: white; border-collapse: collapse; width: 100%;">
+          <thead>
+            <tr>
+              <th>Priority</th>
+              <th>Callback Number</th>
+              <th>Violations</th>
+              <th>Users</th>
+              <th>Category</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows || '<tr><td colspan="7">No callback targets yet. Click “Seed test targets.”</td></tr>'}
+          </tbody>
+        </table>
       </body>
     </html>
   `);
@@ -135,29 +149,49 @@ app.get('/seed-targets', requireAuth, async (req, res) => {
     DO NOTHING
   `);
 
+  res.redirect('/dashboard');
+});
+
+app.get('/investigation/:id', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT * FROM callback_targets WHERE id = $1`,
+    [req.params.id]
+  );
+
+  if (result.rows.length === 0) return res.status(404).send('Target not found');
+
+  const target = result.rows[0];
+
   res.send(`
     <html>
       <body style="font-family: Arial; padding: 40px;">
-        <h2>Seed callback targets created.</h2>
+        <p><a href="/dashboard">← Back to dashboard</a></p>
 
-        <p>
-          <a href="/dashboard">Back to dashboard</a>
-        </p>
+        <h1>${target.callback_number}</h1>
+
+        <p><strong>Priority:</strong> ${target.priority_score || 0}</p>
+        <p><strong>Violations:</strong> ${target.violations_count || 0}</p>
+        <p><strong>Affected Users:</strong> ${target.affected_users_count || 0}</p>
+        <p><strong>Category:</strong> ${target.suspected_category || '—'}</p>
+        <p><strong>Status:</strong> ${target.status}</p>
+
+        <hr>
+
+        <h2>Manual Investigation</h2>
+
+        <p>Call this number manually, then we’ll add result entry next.</p>
       </body>
     </html>
   `);
 });
 
 app.get('/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.redirect('/login');
-  });
+  req.session.destroy(() => res.redirect('/login'));
 });
 
 app.get('/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
-
     res.json({
       ok: true,
       service: 'callback-investigation-console',
@@ -166,7 +200,6 @@ app.get('/health', async (req, res) => {
     });
   } catch (err) {
     console.error('Health check DB error:', err);
-
     res.status(500).json({
       ok: false,
       db_connected: false,
