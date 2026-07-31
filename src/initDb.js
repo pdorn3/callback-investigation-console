@@ -20,6 +20,9 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS investigation_targets (
       id SERIAL PRIMARY KEY,
 
+      source_type TEXT,
+      source_id TEXT,
+
       target_type TEXT NOT NULL DEFAULT 'phone_identity',
       target_label TEXT,
 
@@ -50,6 +53,16 @@ async function initDb() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    ALTER TABLE investigation_targets
+      ADD COLUMN IF NOT EXISTS source_type TEXT;
+
+    ALTER TABLE investigation_targets
+      ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_investigation_targets_source
+      ON investigation_targets(source_type, source_id)
+      WHERE source_type IS NOT NULL AND source_id IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS investigation_target_notes (
       id SERIAL PRIMARY KEY,
       investigation_target_id INTEGER REFERENCES investigation_targets(id) ON DELETE CASCADE,
@@ -68,6 +81,7 @@ async function initDb() {
       email TEXT,
       address TEXT,
       agent_name TEXT,
+      lead_generator TEXT,
       service_category TEXT,
 
       confidence_level TEXT,
@@ -77,6 +91,9 @@ async function initDb() {
       created_by INTEGER REFERENCES investigators(id),
       created_at TIMESTAMP DEFAULT NOW()
     );
+
+    ALTER TABLE investigation_results
+      ADD COLUMN IF NOT EXISTS lead_generator TEXT;
   `);
 }
 

@@ -3,27 +3,44 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { initDb } = require('./initDb');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+
+if (isProduction && !process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET is required in production');
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+if (isProduction) app.set('trust proxy', 1);
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json({ limit: '1mb' }));
 
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || 'change-this-secret',
+    store: new PgSession({
+      pool,
+      createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET || 'callback-local-development-only',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false }
+    cookie: {
+      secure: isProduction,
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 12 * 60 * 60 * 1000
+    }
   })
 );
 
@@ -49,6 +66,85 @@ function safe(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+
+function statusBadge(status) {
+  const normalized = String(status || 'unresolved');
+  const tone =
+    normalized === 'investigated' || normalized === 'resolved'
+      ? 'green'
+      : normalized === 'dead_end' || normalized === 'hostile'
+        ? 'red'
+        : normalized === 'needs_followup' || normalized === 'partial'
+          ? 'amber'
+          : 'blue';
+
+  return `<span class="badge badge-${tone}">${safe(normalized.replace(/_/g, ' '))}</span>`;
+}
+
+function appSidebar(user, active = 'dashboard') {
+  return `
+    <aside class="sidebar glass">
+      <div class="brand">
+        <div class="brand-mark">CS</div>
+        <div class="brand-copy">
+          <div class="brand-name">CallSlayer</div>
+          <div class="brand-subtitle">Investigation Console</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <div class="nav-label">Operations</div>
+        <a class="nav-item ${active === 'dashboard' ? 'active' : ''}" href="/dashboard">
+          <span class="nav-icon">⌂</span><span>Investigation Queue</span>
+        </a>
+        <div class="nav-label">Workspace</div>
+        <a class="nav-item ${active === 'investigation' ? 'active' : ''}" href="/dashboard">
+          <span class="nav-icon">◎</span><span>Target Research</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-block">
+          <div class="avatar">${safe(user.email.slice(0, 1).toUpperCase())}</div>
+          <div class="user-meta">
+            <div class="user-email">${safe(user.email)}</div>
+            <div class="user-role">${safe(user.role)}</div>
+          </div>
+          <a class="logout" href="/logout">Log out</a>
+        </div>
+      </div>
+    </aside>
+  `;
+}
+
+function appDocument({ title, user, active, header, actions = '', content }) {
+  return `<!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>${safe(title)} · CallSlayer</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="/app.css">
+      </head>
+      <body>
+        <div class="app-shell">
+          ${appSidebar(user, active)}
+          <main class="main">
+            <header class="topbar glass">
+              <div>${header}</div>
+              <div class="actions">${actions}</div>
+            </header>
+            <div class="content">${content}</div>
+          </main>
+        </div>
+      </body>
+    </html>`;
+}
+
+app.get('/app.css', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'app.css'));
+});
 
 app.get('/', (req, res) => {
   if (!req.session.user) return res.redirect('/login');
@@ -94,9 +190,12 @@ app.post('/api/import-targets', requireImportKey, async (req, res) => {
       ? req.body.targets
       : [req.body];
 
-    let imported = 0;
+    let created = 0;
+    let updated = 0;
 
     for (const target of targets) {
+      const sourceType = target.source_type || null;
+      const sourceId = target.source_id || target.originating_number || null;
       const targetType = target.target_type || 'phone_identity';
 
       const originatingNumber = target.originating_number || null;
@@ -118,9 +217,11 @@ app.post('/api/import-targets', requireImportKey, async (req, res) => {
         recommendedCallNumber ||
         'Investigation target';
 
-      await pool.query(
+      const importResult = await pool.query(
         `
         INSERT INTO investigation_targets (
+          source_type,
+          source_id,
           target_type,
           target_label,
           originating_number,
@@ -141,11 +242,34 @@ app.post('/api/import-targets', requireImportKey, async (req, res) => {
           last_seen_at
         )
         VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'unresolved',$16,$17
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'unresolved',$18,$19
         )
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (source_type, source_id)
+          WHERE source_type IS NOT NULL AND source_id IS NOT NULL
+        DO UPDATE SET
+          target_type = EXCLUDED.target_type,
+          target_label = EXCLUDED.target_label,
+          originating_number = EXCLUDED.originating_number,
+          latest_callback_number = EXCLUDED.latest_callback_number,
+          all_callback_numbers = EXCLUDED.all_callback_numbers,
+          recommended_call_number = EXCLUDED.recommended_call_number,
+          website_hint = EXCLUDED.website_hint,
+          company_hint = EXCLUDED.company_hint,
+          email_hint = EXCLUDED.email_hint,
+          address_hint = EXCLUDED.address_hint,
+          identity_gap = EXCLUDED.identity_gap,
+          priority_score = EXCLUDED.priority_score,
+          violations_count = EXCLUDED.violations_count,
+          affected_users_count = EXCLUDED.affected_users_count,
+          suspected_category = EXCLUDED.suspected_category,
+          first_seen_at = EXCLUDED.first_seen_at,
+          last_seen_at = EXCLUDED.last_seen_at,
+          updated_at = NOW()
+        RETURNING (xmax = 0) AS inserted
         `,
         [
+          sourceType,
+          sourceId,
           targetType,
           targetLabel,
           originatingNumber,
@@ -166,12 +290,15 @@ app.post('/api/import-targets', requireImportKey, async (req, res) => {
         ]
       );
 
-      imported += 1;
+      if (importResult.rows[0]?.inserted) created += 1;
+      else updated += 1;
     }
 
     res.json({
       ok: true,
-      imported
+      processed: targets.length,
+      created,
+      updated
     });
   } catch (err) {
     console.error('Import targets error:', err);
@@ -185,172 +312,178 @@ app.post('/api/import-targets', requireImportKey, async (req, res) => {
 
 app.get('/dashboard', requireAuth, async (req, res) => {
   const result = await pool.query(`
+    WITH target_groups AS (
+      SELECT
+        COALESCE(
+          recommended_call_number,
+          latest_callback_number,
+          originating_number,
+          'target:' || id::text
+        ) AS investigation_number,
+        ARRAY_AGG(id ORDER BY priority_score DESC, last_seen_at DESC NULLS LAST) AS target_ids,
+        COUNT(*)::integer AS target_count,
+        SUM(violations_count)::integer AS grouped_violations_count,
+        SUM(affected_users_count)::integer AS grouped_affected_users_count,
+        MAX(priority_score)::integer AS source_priority_score,
+        MIN(first_seen_at) AS grouped_first_seen_at,
+        MAX(last_seen_at) AS grouped_last_seen_at,
+        STRING_AGG(DISTINCT originating_number, ', ') FILTER (WHERE originating_number IS NOT NULL) AS grouped_originating_numbers,
+        STRING_AGG(DISTINCT latest_callback_number, ', ') FILTER (WHERE latest_callback_number IS NOT NULL) AS grouped_callback_numbers,
+        (ARRAY_AGG(id ORDER BY priority_score DESC, last_seen_at DESC NULLS LAST))[1] AS representative_id
+      FROM investigation_targets
+      GROUP BY 1
+    )
     SELECT
       t.*,
+      g.investigation_number,
+      g.target_ids,
+      g.target_count,
+      g.grouped_violations_count,
+      g.grouped_affected_users_count,
+      g.source_priority_score,
+      g.grouped_first_seen_at,
+      g.grouped_last_seen_at,
+      g.grouped_originating_numbers,
+      g.grouped_callback_numbers,
       r.company_name,
       r.website,
+      r.lead_generator,
       r.service_category AS resolved_service_category,
       r.outcome AS latest_outcome
-    FROM investigation_targets t
+    FROM target_groups g
+    JOIN investigation_targets t ON t.id = g.representative_id
     LEFT JOIN LATERAL (
       SELECT *
       FROM investigation_results r
-      WHERE r.investigation_target_id = t.id
+      WHERE r.investigation_target_id = ANY(g.target_ids)
       ORDER BY r.created_at DESC
       LIMIT 1
     ) r ON true
-    ORDER BY t.priority_score DESC, t.violations_count DESC, t.last_seen_at DESC NULLS LAST
   `);
 
   const rows = result.rows.map((target) => {
     const category = target.resolved_service_category || target.suspected_category || '—';
-    const displayTarget =
-      target.recommended_call_number ||
-      target.latest_callback_number ||
-      target.originating_number ||
-      target.target_label ||
-      '—';
+    const displayTarget = target.investigation_number.startsWith('target:')
+      ? target.target_label || 'Non-phone target'
+      : target.investigation_number;
+    const daysSinceLastSeen = target.grouped_last_seen_at
+      ? (Date.now() - new Date(target.grouped_last_seen_at).getTime()) / 86400000
+      : Infinity;
+    const violationPoints = Math.min(target.grouped_violations_count, 40);
+    const userPoints = Math.min(target.grouped_affected_users_count * 4, 20);
+    const repeatPoints = Math.min((target.target_count - 1) * 3, 15);
+    const recencyPoints = daysSinceLastSeen <= 7 ? 20 : daysSinceLastSeen <= 30 ? 10 : 0;
+    const callablePoints = target.investigation_number.startsWith('target:') ? 0 : 5;
+    const roiScore = violationPoints + userPoints + repeatPoints + recencyPoints + callablePoints;
 
-    return `
+    return {
+      roiScore,
+      violations: target.grouped_violations_count,
+      html: `
       <tr>
-        <td>${target.priority_score || 0}</td>
-        <td>${safe(target.target_type)}</td>
-        <td><strong>${safe(displayTarget)}</strong></td>
-        <td>${safe(target.originating_number || '—')}</td>
-        <td>${safe(target.latest_callback_number || '—')}</td>
-        <td>${target.violations_count || 0}</td>
-        <td>${target.affected_users_count || 0}</td>
+        <td>
+          <span class="score">${roiScore}</span>
+          <div class="secondary-cell" title="Violations ${violationPoints} + users ${userPoints} + repeats ${repeatPoints} + recency ${recencyPoints} + callable ${callablePoints}">
+            ROI score
+          </div>
+        </td>
+        <td>
+          <div class="primary-cell mono">${safe(displayTarget)}</div>
+          <div class="secondary-cell">${target.target_count} linked source${target.target_count === 1 ? '' : 's'}</div>
+        </td>
+        <td><span class="badge badge-blue">${safe(target.target_type.replace(/_/g, ' '))}</span></td>
+        <td class="mono secondary-cell">${safe(target.grouped_originating_numbers || '—')}</td>
+        <td><strong>${target.grouped_violations_count || 0}</strong></td>
+        <td>${target.grouped_affected_users_count || 0}</td>
         <td>${safe(category)}</td>
-        <td>${safe(target.company_name || target.company_hint || '—')}</td>
-        <td>${target.website ? `<a href="${safe(target.website)}" target="_blank">${safe(target.website)}</a>` : safe(target.website_hint || '—')}</td>
-        <td>${safe(target.status)}</td>
-        <td><a href="/investigation/${target.id}">Open</a></td>
+        <td>
+          <div class="primary-cell">${safe(target.company_name || target.company_hint || 'Unknown')}</div>
+          <div class="secondary-cell">${safe(target.website || target.website_hint || 'No website identified')}</div>
+        </td>
+        <td>${safe(target.lead_generator || '—')}</td>
+        <td>${statusBadge(target.status)}</td>
+        <td><a class="open-link" href="/investigation/${target.id}">Investigate →</a></td>
       </tr>
-    `;
-  }).join('');
+    `
+    };
+  })
+    .sort((a, b) => b.roiScore - a.roiScore || b.violations - a.violations)
+    .map((entry) => entry.html)
+    .join('');
 
-  res.send(`
-    <html>
-      <head>
-        <title>Identity Investigation Console</title>
-      </head>
-      <body style="font-family: Arial; padding: 40px; background: #f9fafb;">
-        <h1>Identity Investigation Console</h1>
+  const totalTargets = result.rows.length;
+  const unresolved = result.rows.filter((target) => target.status === 'unresolved').length;
+  const investigated = result.rows.filter((target) => target.status === 'investigated').length;
+  const totalViolations = result.rows.reduce((sum, target) => sum + (target.grouped_violations_count || 0), 0);
 
-        <p>
-          Logged in as <strong>${safe(req.session.user.email)}</strong>
-          · <a href="/logout">Logout</a>
-        </p>
-
-        <p>
-          <a href="/seed-targets">Seed test targets</a>
-        </p>
-
-        <table border="1" cellpadding="10" cellspacing="0" style="background: white; border-collapse: collapse; width: 100%;">
-          <thead>
-            <tr>
-              <th>Priority</th>
-              <th>Type</th>
-              <th>Recommended Call</th>
-              <th>Originating #</th>
-              <th>Latest Callback #</th>
-              <th>Violations</th>
-              <th>Users</th>
-              <th>Category</th>
-              <th>Company</th>
-              <th>Website</th>
-              <th>Status</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows || '<tr><td colspan="12">No investigation targets yet. Click “Seed test targets.”</td></tr>'}
-          </tbody>
-        </table>
-      </body>
-    </html>
-  `);
-});
-
-app.get('/seed-targets', requireAuth, async (req, res) => {
-  await pool.query(`
-    INSERT INTO investigation_targets (
-      target_type,
-      target_label,
-      originating_number,
-      latest_callback_number,
-      all_callback_numbers,
-      recommended_call_number,
-      company_hint,
-      website_hint,
-      identity_gap,
-      priority_score,
-      violations_count,
-      affected_users_count,
-      suspected_category,
-      status,
-      first_seen_at,
-      last_seen_at
-    )
-    VALUES
-      (
-        'phone_identity',
-        'Originating number with active callback trail',
-        '404-555-1000',
-        '800-555-0101',
-        '877-555-0001, 800-555-0101',
-        '800-555-0101',
-        NULL,
-        NULL,
-        'Need company name and website from callback path',
-        95,
-        87,
-        14,
-        'Medicare',
-        'unresolved',
-        NOW() - INTERVAL '10 days',
-        NOW()
-      ),
-      (
-        'phone_identity',
-        'Originating number; callback appears stale',
-        '404-555-2000',
-        '888-555-0102',
-        '888-555-0102, 888-555-0000',
-        '404-555-2000',
-        NULL,
-        NULL,
-        'Latest callback may be stale; call originating number first',
-        82,
-        64,
-        9,
-        'Warranty',
-        'unresolved',
-        NOW() - INTERVAL '7 days',
-        NOW()
-      ),
-      (
-        'domain_identity',
-        'Domain present but operator unknown',
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        'example-loans.com',
-        'Need company/legal identity behind domain',
-        70,
-        41,
-        5,
-        'Loans',
-        'unresolved',
-        NOW() - INTERVAL '5 days',
-        NOW()
-      )
-    ON CONFLICT DO NOTHING
-  `);
-
-  res.redirect('/dashboard');
+  res.send(appDocument({
+    title: 'Investigation Queue',
+    user: req.session.user,
+    active: 'dashboard',
+    header: `
+      <div class="eyebrow">Identity Operations</div>
+      <h1>Investigation Queue</h1>
+      <div class="subtext">Prioritized callback and identity targets requiring manual research</div>
+    `,
+    actions: `
+      <a class="btn btn-primary" href="/dashboard">Refresh queue</a>
+    `,
+    content: `
+      <section class="metrics">
+        <div class="metric">
+          <div class="metric-label">Investigation Numbers</div>
+          <div class="metric-value">${totalTargets}</div>
+          <div class="metric-note">Consolidated from ${result.rows.reduce((sum, target) => sum + target.target_count, 0)} source targets</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Unresolved</div>
+          <div class="metric-value">${unresolved}</div>
+          <div class="metric-note">Ready for investigator review</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Investigated</div>
+          <div class="metric-value">${investigated}</div>
+          <div class="metric-note">With a saved outcome</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Linked Violations</div>
+          <div class="metric-value">${totalViolations}</div>
+          <div class="metric-note">Evidence records represented</div>
+        </div>
+      </section>
+      <section class="panel glass">
+        <div class="panel-head">
+          <div class="panel-title">
+            <h2>Ranked Investigation Numbers</h2>
+            <p>Grouped by callable number and ranked by expected investigation ROI.</p>
+          </div>
+          <span class="badge badge-green">Live queue</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ROI Rank</th>
+                <th>Investigation Number</th>
+                <th>Type</th>
+                <th>Linked Originating Numbers</th>
+                <th>Violations</th>
+                <th>Users</th>
+                <th>Category</th>
+                <th>Identity</th>
+                <th>Lead Generator</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows || '<tr><td colspan="11"><div class="empty">No investigation targets yet.</div></td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    `
+  }));
 });
 
 app.get('/investigation/:id', requireAuth, async (req, res) => {
@@ -363,15 +496,49 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
 
   const target = targetResult.rows[0];
 
+  const groupResult = await pool.query(
+    `
+    WITH selected AS (
+      SELECT COALESCE(
+        recommended_call_number,
+        latest_callback_number,
+        originating_number,
+        'target:' || id::text
+      ) AS investigation_number
+      FROM investigation_targets
+      WHERE id = $1
+    )
+    SELECT
+      ARRAY_AGG(t.id) AS target_ids,
+      COUNT(*)::integer AS target_count,
+      SUM(t.violations_count)::integer AS violations_count,
+      SUM(t.affected_users_count)::integer AS affected_users_count,
+      MIN(t.first_seen_at) AS first_seen_at,
+      MAX(t.last_seen_at) AS last_seen_at,
+      STRING_AGG(DISTINCT t.originating_number, ', ') FILTER (WHERE t.originating_number IS NOT NULL) AS originating_numbers,
+      STRING_AGG(DISTINCT t.latest_callback_number, ', ') FILTER (WHERE t.latest_callback_number IS NOT NULL) AS callback_numbers
+    FROM investigation_targets t
+    CROSS JOIN selected s
+    WHERE COALESCE(
+      t.recommended_call_number,
+      t.latest_callback_number,
+      t.originating_number,
+      'target:' || t.id::text
+    ) = s.investigation_number
+    `,
+    [req.params.id]
+  );
+  const group = groupResult.rows[0];
+
   const latestResult = await pool.query(
     `
     SELECT *
     FROM investigation_results
-    WHERE investigation_target_id = $1
+    WHERE investigation_target_id = ANY($1::integer[])
     ORDER BY created_at DESC
     LIMIT 1
     `,
-    [req.params.id]
+    [group.target_ids]
   );
 
   const latest = latestResult.rows[0] || {};
@@ -382,96 +549,111 @@ app.get('/investigation/:id', requireAuth, async (req, res) => {
     target.originating_number ||
     '—';
 
-  res.send(`
-    <html>
-      <body style="font-family: Arial; padding: 40px;">
-        <p><a href="/dashboard">← Back to dashboard</a></p>
-
-        <h1>${safe(target.target_label || recommendedCall)}</h1>
-
-        <p><strong>Target Type:</strong> ${safe(target.target_type)}</p>
-        <p><strong>Recommended Call Number:</strong> ${safe(recommendedCall)}</p>
-        <p><strong>Originating Number:</strong> ${safe(target.originating_number || '—')}</p>
-        <p><strong>Latest Callback Number:</strong> ${safe(target.latest_callback_number || '—')}</p>
-        <p><strong>All Callback Numbers:</strong> ${safe(target.all_callback_numbers || '—')}</p>
-        <p><strong>Website Hint:</strong> ${safe(target.website_hint || '—')}</p>
-        <p><strong>Company Hint:</strong> ${safe(target.company_hint || '—')}</p>
-        <p><strong>Identity Gap:</strong> ${safe(target.identity_gap || '—')}</p>
-        <p><strong>Priority:</strong> ${target.priority_score || 0}</p>
-        <p><strong>Violations:</strong> ${target.violations_count || 0}</p>
-        <p><strong>Affected Users:</strong> ${target.affected_users_count || 0}</p>
-        <p><strong>Category:</strong> ${safe(latest.service_category || target.suspected_category || '—')}</p>
-        <p><strong>Status:</strong> ${safe(target.status)}</p>
-
-        <hr>
-
-        <h2>Manual Investigation</h2>
-
-        <form method="POST" action="/investigation/${target.id}/save">
-          <div style="margin-bottom: 12px;">
-            <label>Company Name</label><br>
-            <input type="text" name="company_name" value="${safe(latest.company_name || target.company_hint)}" style="width: 400px; padding: 8px;" />
+  res.send(appDocument({
+    title: target.target_label || recommendedCall,
+    user: req.session.user,
+    active: 'investigation',
+    header: `
+      <div class="eyebrow">Target #${target.id} · ${safe(target.target_type.replace(/_/g, ' '))}</div>
+      <h1>${safe(target.target_label || recommendedCall)}</h1>
+      <div class="subtext">Review source signals and record the verified identity.</div>
+    `,
+    actions: `
+      <a class="btn btn-secondary" href="/dashboard">← Back to queue</a>
+      ${statusBadge(target.status)}
+    `,
+    content: `
+      <section class="detail-grid">
+        <div class="panel glass">
+          <div class="panel-head">
+            <div class="panel-title">
+              <h2>Target Intelligence</h2>
+              <p>Known identifiers and prioritization signals</p>
+            </div>
+            <span class="score">${target.priority_score || 0}</span>
           </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Website</label><br>
-            <input type="text" name="website" value="${safe(latest.website || target.website_hint)}" style="width: 400px; padding: 8px;" />
+          <div class="info-list">
+            <div class="info-row"><div class="info-label">Recommended Call</div><div class="info-value mono">${safe(recommendedCall)}</div></div>
+            <div class="info-row"><div class="info-label">Linked Sources</div><div class="info-value">${group.target_count} source target${group.target_count === 1 ? '' : 's'} grouped under this number</div></div>
+            <div class="info-row"><div class="info-label">Originating Numbers</div><div class="info-value mono">${safe(group.originating_numbers || '—')}</div></div>
+            <div class="info-row"><div class="info-label">Callback Numbers</div><div class="info-value mono">${safe(group.callback_numbers || '—')}</div></div>
+            <div class="info-row"><div class="info-label">Website Hint</div><div class="info-value">${safe(target.website_hint || '—')}</div></div>
+            <div class="info-row"><div class="info-label">Company Hint</div><div class="info-value">${safe(target.company_hint || '—')}</div></div>
+            <div class="info-row"><div class="info-label">Identity Gap</div><div class="info-value">${safe(target.identity_gap || '—')}</div></div>
+            <div class="info-row"><div class="info-label">Violations / Users</div><div class="info-value">${group.violations_count || 0} violations · ${group.affected_users_count || 0} affected-user signals</div></div>
+            <div class="info-row"><div class="info-label">Category</div><div class="info-value">${safe(latest.service_category || target.suspected_category || '—')}</div></div>
           </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Email</label><br>
-            <input type="text" name="email" value="${safe(latest.email || target.email_hint)}" style="width: 400px; padding: 8px;" />
+        </div>
+        <form class="panel glass form-panel" method="POST" action="/investigation/${target.id}/save">
+          <div class="panel-head">
+            <div class="panel-title">
+              <h2>Investigation Result</h2>
+              <p>Capture the verified operator identity and investigation outcome.</p>
+            </div>
+            <span class="badge badge-blue">Manual review</span>
           </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Address</label><br>
-            <input type="text" name="address" value="${safe(latest.address || target.address_hint)}" style="width: 600px; padding: 8px;" />
+          <div class="form-grid">
+            <div class="field">
+              <label for="company_name">Company Name</label>
+              <input id="company_name" type="text" name="company_name" value="${safe(latest.company_name || target.company_hint)}">
+            </div>
+            <div class="field">
+              <label for="website">Website</label>
+              <input id="website" type="url" name="website" value="${safe(latest.website || target.website_hint)}">
+            </div>
+            <div class="field">
+              <label for="email">Email</label>
+              <input id="email" type="email" name="email" value="${safe(latest.email || target.email_hint)}">
+            </div>
+            <div class="field">
+              <label for="agent_name">Agent Name</label>
+              <input id="agent_name" type="text" name="agent_name" value="${safe(latest.agent_name)}">
+            </div>
+            <div class="field">
+              <label for="lead_generator">Lead Generator</label>
+              <input id="lead_generator" type="text" name="lead_generator" value="${safe(latest.lead_generator)}" placeholder="Company or source that generated the lead">
+            </div>
+            <div class="field full">
+              <label for="address">Address</label>
+              <input id="address" type="text" name="address" value="${safe(latest.address || target.address_hint)}">
+            </div>
+            <div class="field">
+              <label for="service_category">Service Category</label>
+              <input id="service_category" type="text" name="service_category" value="${safe(latest.service_category || target.suspected_category)}">
+            </div>
+            <div class="field">
+              <label for="confidence_level">Confidence</label>
+              <select id="confidence_level" name="confidence_level">
+                <option value="">Select confidence</option>
+                <option value="high" ${latest.confidence_level === 'high' ? 'selected' : ''}>High</option>
+                <option value="medium" ${latest.confidence_level === 'medium' ? 'selected' : ''}>Medium</option>
+                <option value="low" ${latest.confidence_level === 'low' ? 'selected' : ''}>Low</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="outcome">Outcome</label>
+              <select id="outcome" name="outcome">
+                <option value="resolved" ${latest.outcome === 'resolved' ? 'selected' : ''}>Resolved</option>
+                <option value="partial" ${latest.outcome === 'partial' ? 'selected' : ''}>Partial</option>
+                <option value="dead_end" ${latest.outcome === 'dead_end' ? 'selected' : ''}>Dead End</option>
+                <option value="ivr_only" ${latest.outcome === 'ivr_only' ? 'selected' : ''}>IVR Only</option>
+                <option value="hostile" ${latest.outcome === 'hostile' ? 'selected' : ''}>Hostile</option>
+                <option value="needs_followup" ${latest.outcome === 'needs_followup' ? 'selected' : ''}>Needs Follow-Up</option>
+              </select>
+            </div>
+            <div class="field full">
+              <label for="notes">Investigator Notes</label>
+              <textarea id="notes" name="notes" placeholder="Document who answered, what was disclosed, and any recommended follow-up.">${safe(latest.notes)}</textarea>
+            </div>
           </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Agent Name</label><br>
-            <input type="text" name="agent_name" value="${safe(latest.agent_name)}" style="width: 400px; padding: 8px;" />
+          <div class="form-actions">
+            <a class="btn btn-secondary" href="/dashboard">Cancel</a>
+            <button class="btn btn-primary" type="submit">Save investigation result</button>
           </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Service Category</label><br>
-            <input type="text" name="service_category" value="${safe(latest.service_category || target.suspected_category)}" style="width: 400px; padding: 8px;" />
-          </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Confidence</label><br>
-            <select name="confidence_level" style="width: 250px; padding: 8px;">
-              <option value="">Select</option>
-              <option value="high" ${latest.confidence_level === 'high' ? 'selected' : ''}>High</option>
-              <option value="medium" ${latest.confidence_level === 'medium' ? 'selected' : ''}>Medium</option>
-              <option value="low" ${latest.confidence_level === 'low' ? 'selected' : ''}>Low</option>
-            </select>
-          </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Outcome</label><br>
-            <select name="outcome" style="width: 250px; padding: 8px;">
-              <option value="resolved" ${latest.outcome === 'resolved' ? 'selected' : ''}>Resolved</option>
-              <option value="partial" ${latest.outcome === 'partial' ? 'selected' : ''}>Partial</option>
-              <option value="dead_end" ${latest.outcome === 'dead_end' ? 'selected' : ''}>Dead End</option>
-              <option value="ivr_only" ${latest.outcome === 'ivr_only' ? 'selected' : ''}>IVR Only</option>
-              <option value="hostile" ${latest.outcome === 'hostile' ? 'selected' : ''}>Hostile</option>
-              <option value="needs_followup" ${latest.outcome === 'needs_followup' ? 'selected' : ''}>Needs Follow-Up</option>
-            </select>
-          </div>
-
-          <div style="margin-bottom: 12px;">
-            <label>Notes</label><br>
-            <textarea name="notes" rows="6" style="width: 600px; padding: 8px;">${safe(latest.notes)}</textarea>
-          </div>
-
-          <button type="submit" style="padding: 10px 18px;">
-            Save Investigation Result
-          </button>
         </form>
-      </body>
-    </html>
-  `);
+      </section>
+    `
+  }));
 });
 
 app.post('/investigation/:id/save', requireAuth, async (req, res) => {
@@ -482,6 +664,7 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
       email,
       address,
       agent_name,
+      lead_generator,
       service_category,
       confidence_level,
       outcome,
@@ -497,13 +680,14 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
         email,
         address,
         agent_name,
+        lead_generator,
         service_category,
         confidence_level,
         outcome,
         notes,
         created_by
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       `,
       [
         req.params.id,
@@ -512,6 +696,7 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
         email,
         address,
         agent_name,
+        lead_generator,
         service_category,
         confidence_level,
         outcome,
@@ -522,6 +707,16 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
 
     await pool.query(
       `
+      WITH selected AS (
+        SELECT COALESCE(
+          recommended_call_number,
+          latest_callback_number,
+          originating_number,
+          'target:' || id::text
+        ) AS investigation_number
+        FROM investigation_targets
+        WHERE id = $1
+      )
       UPDATE investigation_targets
       SET status = $2,
           suspected_category = COALESCE(NULLIF($3, ''), suspected_category),
@@ -530,7 +725,13 @@ app.post('/investigation/:id/save', requireAuth, async (req, res) => {
           email_hint = COALESCE(NULLIF($6, ''), email_hint),
           address_hint = COALESCE(NULLIF($7, ''), address_hint),
           updated_at = NOW()
-      WHERE id = $1
+      FROM selected
+      WHERE COALESCE(
+        investigation_targets.recommended_call_number,
+        investigation_targets.latest_callback_number,
+        investigation_targets.originating_number,
+        'target:' || investigation_targets.id::text
+      ) = selected.investigation_number
       `,
       [
         req.params.id,
